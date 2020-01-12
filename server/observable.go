@@ -25,6 +25,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nats-io/nuid"
 )
 
 type ObservableInfo struct {
@@ -54,12 +56,25 @@ type CreateObservableRequest struct {
 }
 
 type ObservableAckSampleEvent struct {
+	Schema     string `json:"schema"`
+	ID         string `json:"id"`
+	Time       int64  `json:"timestamp"`
 	MsgSet     string `json:"msg_set"`
 	Observable string `json:"obs"`
 	ObsSeq     uint64 `json:"obs_seq"`
 	MsgSetSeq  uint64 `json:"msg_set_seq"`
 	Delay      int64  `json:"ack_time"`
 	Deliveries uint64 `json:"delivered"`
+}
+
+type ObservableDeliveryExceededEvent struct {
+	Schema     string `json:"schema"`
+	ID         string `json:"id"`
+	Time       int64  `json:"timestamp"`
+	MsgSet     string `json:"msg_set"`
+	Observable string `json:"obs"`
+	MsgSetSeq  uint64 `json:"msg_set_seq"`
+	Delivered  uint64 `json:"delivered"`
 }
 
 // AckPolicy determines how the observable should acknowledge delivered messages.
@@ -118,37 +133,38 @@ var (
 
 // Observable is a jetstream observable/subscriber.
 type Observable struct {
-	mu          sync.Mutex
-	mset        *MsgSet
-	acc         *Account
-	name        string
-	msetName    string
-	sseq        uint64
-	dseq        uint64
-	adflr       uint64
-	asflr       uint64
-	dsubj       string
-	reqSub      *subscription
-	ackSub      *subscription
-	ackReplyT   string
-	nextMsgSubj string
-	pending     map[uint64]int64
-	ptmr        *time.Timer
-	rdq         []uint64
-	rdc         map[uint64]uint64
-	maxdc       uint64
-	waiting     []string
-	config      ObservableConfig
-	store       ObservableStore
-	active      bool
-	replay      bool
-	dtmr        *time.Timer
-	dthresh     time.Duration
-	fch         chan struct{}
-	qch         chan struct{}
-	inch        chan bool
-	sfreq       int32
-	ackSampleT  string
+	mu              sync.Mutex
+	mset            *MsgSet
+	acc             *Account
+	name            string
+	msetName        string
+	sseq            uint64
+	dseq            uint64
+	adflr           uint64
+	asflr           uint64
+	dsubj           string
+	reqSub          *subscription
+	ackSub          *subscription
+	ackReplyT       string
+	nextMsgSubj     string
+	pending         map[uint64]int64
+	ptmr            *time.Timer
+	rdq             []uint64
+	rdc             map[uint64]uint64
+	maxdc           uint64
+	waiting         []string
+	config          ObservableConfig
+	store           ObservableStore
+	active          bool
+	replay          bool
+	dtmr            *time.Timer
+	dthresh         time.Duration
+	fch             chan struct{}
+	qch             chan struct{}
+	inch            chan bool
+	sfreq           int32
+	ackSampleT      string
+	deliveryExceedT string
 }
 
 const (
@@ -279,6 +295,7 @@ func (mset *MsgSet) AddObservable(config *ObservableConfig) (*Observable, error)
 	// already under lock, mset.Name() would deadlock
 	o.msetName = mset.config.Name
 	o.ackSampleT = JetStreamObservableAckSamplePre + "." + o.msetName + "." + o.name
+	o.deliveryExceedT = JetStreamObservableMaxDeliverExceedSamplePre + "." + o.msetName + "." + o.name
 
 	store, err := mset.store.ObservableStore(o.name, config)
 	if err != nil {
@@ -673,12 +690,34 @@ func (o *Observable) shouldSample() bool {
 	return false
 }
 
+func (o *Observable) notifyDeliveryExceeded(sseq, dcount uint64) {
+	e := &ObservableDeliveryExceededEvent{
+		Schema:     "io.nats.jetstream.event.v1.max_deliver",
+		ID:         nuid.Next(),
+		Time:       time.Now().UTC().UnixNano(),
+		MsgSet:     o.msetName,
+		Observable: o.name,
+		MsgSetSeq:  sseq,
+		Delivered:  dcount,
+	}
+
+	j, err := json.MarshalIndent(e, "", "  ")
+	if err != nil {
+		return
+	}
+
+	o.mset.sendq <- &jsPubMsg{o.deliveryExceedT, o.deliveryExceedT, _EMPTY_, j, o, 0}
+}
+
 func (o *Observable) sampleAck(sseq, dseq, dcount uint64) {
 	if !o.shouldSample() {
 		return
 	}
 
 	e := &ObservableAckSampleEvent{
+		Schema:     "io.nats.jetstream.event.v1.obs_ack",
+		ID:         nuid.Next(),
+		Time:       time.Now().UTC().UnixNano(),
 		MsgSet:     o.msetName,
 		Observable: o.name,
 		ObsSeq:     dseq,
@@ -814,6 +853,7 @@ func (o *Observable) getNextMsg() (string, []byte, uint64, uint64, error) {
 	if o.mset == nil {
 		return _EMPTY_, nil, 0, 0, fmt.Errorf("observable not valid")
 	}
+
 	for {
 		seq, dcount := o.sseq, uint64(1)
 		if len(o.rdq) > 0 {
@@ -821,6 +861,9 @@ func (o *Observable) getNextMsg() (string, []byte, uint64, uint64, error) {
 			o.rdq = append(o.rdq[:0], o.rdq[1:]...)
 			dcount = o.incDeliveryCount(seq)
 			if o.maxdc > 0 && dcount > o.maxdc {
+				if dcount == o.maxdc+1 {
+					o.notifyDeliveryExceeded(seq, dcount-1)
+				}
 				continue
 			}
 		}

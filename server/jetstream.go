@@ -136,8 +136,11 @@ const (
 	// JetStreamMsgBySeq is the prefix for direct requests for a message by message set sequence number
 	JetStreamMsgBySeqPre = "$JS.BYSEQ"
 
-	// JetStreamObservableAckSamplePre is the prefix for sample messages from observables
-	JetStreamObservableAckSamplePre = "$JS.OBSERVABLE.ACKSAMPLE"
+	// JetStreamObservableAckSamplePre is the prefix for sample messages from Observables when messages are acknowledged
+	JetStreamObservableAckSamplePre = "$JS.EVENTS.OBSERVABLE.ACKSAMPLE"
+
+	// JetStreamObservableMaxDeliverExceedSamplePre is the prefix for an event published when a Observable stops delivering a message due to maximum deliveries
+	JetStreamObservableMaxDeliverExceedSamplePre = "$JS.EVENTS.OBSERVABLE.MAXDELIVER"
 )
 
 // This is for internal accounting for JetStream for this server.
